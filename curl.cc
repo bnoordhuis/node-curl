@@ -186,12 +186,14 @@ Handle<Value> MultiHandle::Add(EasyHandle& ch) {
 }
 
 Handle<Value> MultiHandle::Remove(EasyHandle& ch) {
+	assert(num_handles_ > 0);
+
 	const CURLMcode status = curl_multi_remove_handle(mh_, ch);
 	if (status != CURLM_OK) {
 		return CurlError(status);
 	}
 
-	if (--num_handles_ == 1) {
+	if (--num_handles_ == 0) {
 		// stop the event loop
 		ev_unref();
 	}
