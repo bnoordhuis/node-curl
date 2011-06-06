@@ -15,78 +15,6 @@ namespace {
 
 Persistent<ObjectTemplate> curlHandleTemplate;
 
-class CurlHandle: public ObjectWrap {
-public:
-	static Handle<Object> New() {
-		CurlHandle* const ch = new CurlHandle();
-
-		// glue C++ object to a V8-managed JS object
-		Local<Object> handle = curlHandleTemplate->NewInstance();
-		handle->SetPointerInInternalField(1, reinterpret_cast<void*>(&curlHandleTemplate)); // magic cookie
-		ch->Wrap(handle);
-
-		return ch->handle_;
-	}
-
-	static bool IsInstanceOf(Handle<Value> val) {
-		if (val->IsObject()) {
-			Local<Object> o = val->ToObject();
-			return o->InternalFieldCount() >= 2
-				&& o->GetPointerFromInternalField(1) == reinterpret_cast<void*>(&curlHandleTemplate);
-		}
-		else {
-			return false;
-		}
-	}
-
-	static CurlHandle* Unwrap(Handle<Value> handle) {
-		if (IsInstanceOf(handle)) {
-			return ObjectWrap::Unwrap<CurlHandle>(handle->ToObject());
-		}
-		else {
-			return NULL;
-		}
-	}
-
-	~CurlHandle() {
-		read_callback_.Dispose();
-		write_callback_.Dispose();
-		curl_easy_cleanup(ch_);
-	}
-
-	operator CURL*() {
-		return ch_;
-	}
-
-	void SetWriteCallback(Handle<Value> callback) {
-		Local<Function> fun = Local<Function>(Function::Cast(*callback));
-		write_callback_.Clear();
-		write_callback_ = Persistent<Function>::New(fun);
-	}
-
-	Handle<Value> InvokeWriteCallback(Buffer* data) {
-		HandleScope scope;
-
-		Local<Object> global = Context::GetCurrent()->Global();
-		Handle<Value> args[] = { data->handle_ };
-		Local<Value> rv = write_callback_->Call(global, 1, args);
-
-		return scope.Close(rv);
-	}
-
-private:
-	CURL* const ch_;
-	Persistent<Function> read_callback_;
-	Persistent<Function> write_callback_;
-
-	CurlHandle(): ch_(curl_easy_init()) {
-		if (ch_ == 0) {
-			// raise OOM exception?
-			V8::LowMemoryNotification();
-		}
-	}
-};
-
 Handle<Value> Error(const char* message) {
 	return ThrowException(
 		Exception::Error(
@@ -99,10 +27,181 @@ Handle<Value> TypeError(const char* message) {
 			String::New(message)));
 }
 
-Handle<Value> CurlError(CURLcode status) {
+template <class T> Handle<Value> CurlError(T status);
+
+template <> Handle<Value> CurlError<CURLcode>(CURLcode status) {
 	return Error(curl_easy_strerror(status));
 }
 
+template <> Handle<Value> CurlError<CURLMcode>(CURLMcode status) {
+	return Error(curl_multi_strerror(status));
+}
+
+//
+// CurlHandle definition
+//
+class CurlHandle: public ObjectWrap {
+public:
+	static Handle<Object> New();
+	static bool IsInstanceOf(Handle<Value> val);
+	static CurlHandle* Unwrap(Handle<Value> handle);
+
+	void SetWriteCallback(Handle<Value> callback);
+	Handle<Value> InvokeWriteCallback(Buffer* data);
+	operator CURL*();
+	virtual ~CurlHandle();
+
+private:
+	CURL* const ch_;
+	Persistent<Function> read_callback_;
+	Persistent<Function> write_callback_;
+
+	CurlHandle();
+};
+
+//
+// MultiHandle definition
+//
+class MultiHandle {
+public:
+	static bool Initialize();
+	static MultiHandle& Singleton();
+	Handle<Value> Add(CurlHandle& ch);
+	Handle<Value> Remove(CurlHandle& ch);
+
+private:
+	static MultiHandle* singleton_;
+	unsigned num_handles_;
+	CURLM* const mh_;
+
+	MultiHandle();
+	~MultiHandle();
+};
+
+//
+// CurlHandle implementation
+//
+Handle<Object> CurlHandle::New() {
+	CurlHandle* const ch = new CurlHandle();
+
+	// glue C++ object to a V8-managed JS object
+	Local<Object> handle = curlHandleTemplate->NewInstance();
+	handle->SetPointerInInternalField(1, reinterpret_cast<void*>(&curlHandleTemplate)); // magic cookie
+	ch->Wrap(handle);
+
+	return ch->handle_;
+}
+
+bool CurlHandle::IsInstanceOf(Handle<Value> val) {
+	if (val->IsObject()) {
+		Local<Object> o = val->ToObject();
+		return o->InternalFieldCount() >= 2
+			&& o->GetPointerFromInternalField(1) == reinterpret_cast<void*>(&curlHandleTemplate);
+	}
+	else {
+		return false;
+	}
+}
+
+CurlHandle* CurlHandle::Unwrap(Handle<Value> handle) {
+	if (IsInstanceOf(handle)) {
+		return ObjectWrap::Unwrap<CurlHandle>(handle->ToObject());
+	}
+	else {
+		return NULL;
+	}
+}
+
+CurlHandle::CurlHandle(): ch_(curl_easy_init()) {
+	if (ch_ == NULL) {
+		Error("curl_easy_init() returned NULL!");
+	}
+}
+
+CurlHandle::~CurlHandle() {
+	read_callback_.Dispose();
+	write_callback_.Dispose();
+	MultiHandle::Singleton().Remove(*this);
+	curl_easy_cleanup(ch_);
+}
+
+CurlHandle::operator CURL*() {
+	return ch_;
+}
+
+void CurlHandle::SetWriteCallback(Handle<Value> callback) {
+	Local<Function> fun = Local<Function>(Function::Cast(*callback));
+	write_callback_.Clear();
+	write_callback_ = Persistent<Function>::New(fun);
+}
+
+Handle<Value> CurlHandle::InvokeWriteCallback(Buffer* data) {
+	HandleScope scope;
+
+	Local<Object> global = Context::GetCurrent()->Global();
+	Handle<Value> args[] = { data->handle_ };
+	Local<Value> rv = write_callback_->Call(global, 1, args);
+
+	return scope.Close(rv);
+}
+
+//
+// MultiHandle implementation
+//
+MultiHandle* MultiHandle::singleton_;
+
+MultiHandle::MultiHandle(): mh_(curl_multi_init()) {
+	if (mh_ == 0) {
+		Error("curl_multi_init() returned NULL!");
+	}
+}
+
+MultiHandle::~MultiHandle() {
+	// complain if there are still easy handles pending?
+	curl_multi_cleanup(mh_);
+}
+
+bool MultiHandle::Initialize() {
+	assert(singleton_ == NULL);
+	singleton_ = new MultiHandle();
+	return singleton_->mh_ != NULL;
+}
+
+MultiHandle& MultiHandle::Singleton() {
+	return *singleton_;
+}
+
+Handle<Value> MultiHandle::Add(CurlHandle& ch) {
+	const CURLMcode status = curl_multi_add_handle(mh_, ch);
+	if (status != CURLM_OK) {
+		return CurlError(status);
+	}
+
+	if (++num_handles_ == 1) {
+		// start the event loop
+		ev_ref();
+	}
+
+	return Undefined();
+}
+
+Handle<Value> MultiHandle::Remove(CurlHandle& ch) {
+	const CURLMcode status = curl_multi_remove_handle(mh_, ch);
+	if (status != CURLM_OK) {
+		return CurlError(status);
+	}
+
+	if (--num_handles_ == 1) {
+		// stop the event loop
+		ev_unref();
+	}
+
+	return Undefined();
+}
+
+//
+// helpers
+//
 size_t WriteFunction(char* data, size_t size, size_t nmemb, void* arg) {
 	CurlHandle* ch = reinterpret_cast<CurlHandle*>(arg);
 
@@ -118,6 +217,9 @@ size_t WriteFunction(char* data, size_t size, size_t nmemb, void* arg) {
 	return nmemb;
 }
 
+//
+// bindings (glue)
+//
 Handle<Value> curl_easy_init_g(const Arguments& args) {
 	return CurlHandle::New();
 }
@@ -392,15 +494,9 @@ Handle<Value> curl_easy_perform_g(const Arguments& args) {
 	if (!CurlHandle::IsInstanceOf(args[0])) {
 		return TypeError("Argument #1 must be a node-curl handle.");
 	}
+
 	CurlHandle* ch = CurlHandle::Unwrap(args[0]);
-
-	CURLcode status = curl_easy_perform(*ch);
-	if (status != CURLE_OK) {
-		// TODO throw a {code, message} exception
-		return CurlError(status);
-	}
-
-	return Undefined();
+	return MultiHandle::Singleton().Add(*ch);
 }
 
 void RegisterModule(Handle<Object> target) {
@@ -413,6 +509,11 @@ void RegisterModule(Handle<Object> target) {
 		return;
 	}
 	atexit(curl_global_cleanup);
+
+	if (!MultiHandle::Initialize()) {
+		Error("curl_multi_init() returned NULL!");
+		return;
+	}
 
 	target->Set(
 		String::NewSymbol("curl_easy_init"),
