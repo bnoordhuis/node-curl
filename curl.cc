@@ -1,6 +1,7 @@
-#include <stdlib.h>
-#include <string.h>
-#include <assert.h>
+#include <cstdlib>
+#include <cstring>
+#include <cassert>
+#include <map>
 
 #include <curl/curl.h>
 
@@ -67,15 +68,26 @@ public:
 	static bool Initialize();
 	static MultiHandle& Singleton();
 	Handle<Value> Add(EasyHandle& ch);
-	Handle<Value> Remove(EasyHandle& ch);
 
 private:
-	static MultiHandle* singleton_;
+	typedef std::map<curl_socket_t, ev_io> SockFDs;
+
 	unsigned num_handles_;
+	SockFDs sockfds_;
 	CURLM* const mh_;
+	ev_timer timer_;
 
 	MultiHandle();
 	~MultiHandle();
+	bool ProcessEvents();
+
+	static int TimerFunction(CURLM* mh, long timeout, void* userp);
+	static int SocketFunction(
+		CURLM* mh, curl_socket_t sockfd, int events, void* userp, void* socketp);
+	static void IOEventFunction(ev_io* w, int events);
+	static void TimerEventFunction(ev_timer* w, int events);
+
+	static MultiHandle* singleton_;
 };
 
 //
@@ -121,7 +133,6 @@ EasyHandle::EasyHandle(): ch_(curl_easy_init()) {
 EasyHandle::~EasyHandle() {
 	read_callback_.Dispose();
 	write_callback_.Dispose();
-	MultiHandle::Singleton().Remove(*this);
 	curl_easy_cleanup(ch_);
 }
 
@@ -150,9 +161,18 @@ Handle<Value> EasyHandle::InvokeWriteCallback(Buffer* data) {
 //
 MultiHandle* MultiHandle::singleton_;
 
-MultiHandle::MultiHandle(): mh_(curl_multi_init()) {
+MultiHandle::MultiHandle(): num_handles_(0), mh_(curl_multi_init()) {
 	if (mh_ == 0) {
 		Error("curl_multi_init() returned NULL!");
+	}
+	else {
+		curl_multi_setopt(mh_, CURLMOPT_SOCKETFUNCTION, SocketFunction);
+		curl_multi_setopt(mh_, CURLMOPT_SOCKETDATA, this);
+
+		curl_multi_setopt(mh_, CURLMOPT_TIMERFUNCTION, TimerFunction);
+		curl_multi_setopt(mh_, CURLMOPT_TIMERDATA, this);
+
+		ev_init(&timer_, TimerEventFunction);
 	}
 }
 
@@ -171,32 +191,130 @@ MultiHandle& MultiHandle::Singleton() {
 	return *singleton_;
 }
 
+bool MultiHandle::ProcessEvents() {
+	int running_handles;
+	CURLMcode status;
+
+	running_handles = 0;
+	do {
+		status = curl_multi_socket_all(mh_, &running_handles);
+	}
+	while (status == CURLM_CALL_MULTI_PERFORM);
+
+	if (status != CURLM_OK) {
+		CurlError(status); // safe to call, this code runs in the same thread as V8
+	}
+
+	if (running_handles == 0) {
+		ev_timer_stop(&timer_);
+		ev_unref();
+	}
+
+	int msgs_in_queue;
+	CURLMsg *msg;
+
+	msgs_in_queue = 0;
+	while ((msg = curl_multi_info_read(mh_, &msgs_in_queue))) {
+		if (msg->msg == CURLMSG_DONE) {
+			curl_multi_remove_handle(mh_, msg->easy_handle);
+		}
+	}
+	assert(msgs_in_queue == 0);
+
+	return status == CURLM_OK;
+}
+
+void MultiHandle::TimerEventFunction(ev_timer* w, int events) {
+	MultiHandle& self = *reinterpret_cast<MultiHandle*>(w->data);
+
+	fprintf(stderr, "%s: events=%d\n", __func__, events);
+	self.ProcessEvents();
+}
+
+int MultiHandle::TimerFunction(CURLM* /*handle*/, long timeout, void* userp) {
+	MultiHandle& self = *reinterpret_cast<MultiHandle*>(userp);
+
+	if (timeout > 1000) timeout = 1000;
+
+	fprintf(stderr, "%s: timeout=%ld\n", __func__, timeout);
+	ev_timer_stop(&self.timer_);
+	ev_timer_set(&self.timer_, timeout / 1000., timeout / 1000.);
+	ev_timer_start(&self.timer_);
+	self.timer_.data = reinterpret_cast<void*>(&self);
+
+	return CURLM_OK;
+}
+
+int curl2ev(int events) {
+	if (events == CURL_POLL_IN) {
+		return EV_READ;
+	}
+	if (events == CURL_POLL_OUT) {
+		return EV_WRITE;
+	}
+	if (events == CURL_POLL_INOUT) {
+		return EV_READ | EV_WRITE;
+	}
+	return 0;
+}
+
+int MultiHandle::SocketFunction(
+	CURLM* /*handle*/, curl_socket_t sockfd, int events, void* userp, void* /*socketp*/)
+{
+	MultiHandle& self = *reinterpret_cast<MultiHandle*>(userp);
+
+	fprintf(stderr, "%s: sockfd=%d, events=%d\n", __func__, sockfd, events);
+
+	// translate curl flags to libev flags
+	events = curl2ev(events);
+
+	SockFDs::iterator it = self.sockfds_.find(sockfd);
+	if (it == self.sockfds_.end()) {
+		if (events) {
+			// create I/O watcher and add it to the list
+			ev_io& w = self.sockfds_.insert(SockFDs::value_type(sockfd, ev_io())).first->second;
+			ev_io_init(&w, IOEventFunction, sockfd, events);
+			ev_io_start(&w);
+			w.data = reinterpret_cast<void*>(&self);
+		}
+		else {
+			assert(0 && "CURL_POLL_NONE or CURL_POLL_REMOVE for bad socket");
+		}
+	}
+	else {
+		ev_io& w = it->second;
+		if (events) {
+			// update the event flags
+			ev_io_set(&w, sockfd, events);
+		}
+		else {
+			// disarm and dispose fd watcher
+			ev_io_stop(&w);
+			self.sockfds_.erase(it);
+		}
+	}
+
+	return CURLM_OK;
+}
+
+void MultiHandle::IOEventFunction(ev_io* w, int events) {
+	MultiHandle& self = *reinterpret_cast<MultiHandle*>(w->data);
+
+	fprintf(stderr, "%s: sockfd=%d, events=%d\n", __func__, w->fd, events);
+	self.ProcessEvents();
+}
+
 Handle<Value> MultiHandle::Add(EasyHandle& ch) {
-	const CURLMcode status = curl_multi_add_handle(mh_, ch);
+	CURLMcode status = curl_multi_add_handle(mh_, ch);
 	if (status != CURLM_OK) {
 		return CurlError(status);
 	}
 
 	if (++num_handles_ == 1) {
-		// start the event loop
 		ev_ref();
 	}
 
-	return Undefined();
-}
-
-Handle<Value> MultiHandle::Remove(EasyHandle& ch) {
-	assert(num_handles_ > 0);
-
-	const CURLMcode status = curl_multi_remove_handle(mh_, ch);
-	if (status != CURLM_OK) {
-		return CurlError(status);
-	}
-
-	if (--num_handles_ == 0) {
-		// stop the event loop
-		ev_unref();
-	}
+	ProcessEvents();
 
 	return Undefined();
 }
@@ -222,7 +340,7 @@ size_t WriteFunction(char* data, size_t size, size_t nmemb, void* arg) {
 //
 // bindings (glue)
 //
-Handle<Value> curl_easy_init_g(const Arguments& args) {
+Handle<Value> curl_easy_init_g(const Arguments& /*args*/) {
 	return EasyHandle::New();
 }
 
